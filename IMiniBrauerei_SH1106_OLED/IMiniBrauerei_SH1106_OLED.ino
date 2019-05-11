@@ -7,6 +7,7 @@
 // D8 : Alarm
 
 #include <ESP8266WiFi.h>                             //https://github.com/esp8266/Arduino
+#include <WiFiClient.h>                              //https://github.com/esp8266/Arduino
 #include <EEPROM.h>                                  
 #include <WiFiManager.h>                             //https://github.com/kentaylor/WiFiManager
 #include <ESP8266WebServer.h>                        //http://www.wemos.cc/tutorial/get_started_in_arduino.html
@@ -15,7 +16,7 @@
 // #include "SSD1306Wire.h"                             //https://github.com/squix78/esp8266-oled-ssd1306 
 #include "SH1106Wire.h"                             //https://github.com/squix78/esp8266-oled-ssd1306 
 
-#define Version "1.0.2_ESP+OLED"
+#define Version "1.1.0_ESP+OLED"
 
 #define deltaMeldungMillis 5000                      // Sendeintervall an die Brauerei in Millisekunden
 #define DRD_TIMEOUT 10                               // Number of seconds after reset during which a subseqent reset will be considered a double reset.
@@ -30,12 +31,16 @@ SH1106Wire  display(0x3c, D1, D2);
 DoubleResetDetector drd(DRD_TIMEOUT, DRD_ADDRESS);
 
 IPAddress UDPip(192,168,178,255);                     // IP-Adresse an welche UDP-Nachrichten geschickt werden xx.xx.xx.255 = Alle Netzwerkteilnehmer die am Port horchen.
+IPAddress myIP(192,168,4,1);                          // IP-Adresse als HotSpot
 unsigned int answerPort = 5003;                       // Port auf den Temperaturen geschickt werden
 unsigned int localPort = 5010;                        // Port auf dem gelesen wird
 ESP8266WebServer server(80);                          // Webserver initialisieren auf Port 80
 WiFiUDP Udp;
 
 OneWire ds(D3); 
+
+const char *ssid = "IMiniBrauerei";
+const char *password = "IMiniBrauerei";
 
 const int PIN_LED = D4;                                // Controls the onboard LED.
 
@@ -50,7 +55,7 @@ char temprec[24] = "";
 char relais[5] = "";
 char state[3] = "";
 
-bool HLowActive, RLowActive, PLowActive, ALowActive = true;
+bool HLowActive, RLowActive, PLowActive, ALowActive, HotSpot = true;
 
 bool initialConfig = false;                             // Indicates whether ESP has WiFi credentials saved from previous session, or double reset detected
 unsigned long jetztMillis = 0, letzteInMillis = 0, letzteOfflineMillis = 0, letzteTempMillis = 0, displayMillis=0;
@@ -428,6 +433,7 @@ void ReadSettings() {
   EEPROM.get(50, RLowActive);
   EEPROM.get(60, PLowActive);
   EEPROM.get(70, ALowActive);
+  EEPROM.get(90, HotSpot);
   EEPROM.commit();
   EEPROM.end();
 }  
@@ -440,6 +446,7 @@ void WriteSettings() {
   EEPROM.put(50, RLowActive);
   EEPROM.put(60, PLowActive);
   EEPROM.put(70, ALowActive);
+  EEPROM.put(90, HotSpot);
   EEPROM.end();    
 }
 
@@ -461,20 +468,10 @@ void setup() {
   // display.flipScreenVertically();
   display.setFont(ArialMT_Plain_10);
 
-  WiFi.mode(WIFI_STA); // Force to station mode because if device was switched off while in access point mode it will start up next time in access point mode.
-  WiFi.setOutputPower(20.5);
-  WiFi.setAutoConnect(true);
-  WiFi.setAutoReconnect(true);
-
   ReadSettings();
 
   WiFi.printDiag(Serial);            //Remove this line if you do not want to see WiFi password printed
 
-  if (WiFi.SSID()==""){
-    Serial.println("We haven't got any access point credentials, so get them now");   
-    initialConfig = true;
-  }
- 
   if (drd.detectDoubleReset()) {
     Serial.println("Double Reset Detected");
     initialConfig = true;
@@ -484,6 +481,12 @@ void setup() {
     Serial.println("Starting configuration portal.");
     digitalWrite(PIN_LED, LOW); // turn the LED on by making the voltage LOW to tell us we are in configuration mode.
     char convertedValue[5];
+
+    char hotspot[24] = "type=\"checkbox\"";
+    if (HotSpot) {
+      strcat(hotspot, " checked");
+    }
+    WiFiManagerParameter p_hotspot("HotSpot", "Create HotSpot", "T", 2, hotspot, WFM_LABEL_AFTER);
 
     sprintf(convertedValue, "%d", answerPort);
     WiFiManagerParameter p_answerPort("answerPort", "send temperature on UDP Port", convertedValue, 5);
@@ -517,6 +520,7 @@ void setup() {
 
     WiFiManager wifiManager;
     wifiManager.setBreakAfterConfig(true);
+    wifiManager.addParameter(&p_hotspot);
     wifiManager.addParameter(&p_answerPort);
     wifiManager.addParameter(&p_localPort);
     wifiManager.addParameter(&p_hlowactive);
@@ -531,7 +535,8 @@ void setup() {
       //if you get here you have connected to the WiFi
       Serial.println("connected...yeey :)");
     }
-    
+ 
+    HotSpot = (strncmp(p_hotspot.getValue(), "T", 1) == 0);
     answerPort = atoi(p_answerPort.getValue());
     localPort = atoi(p_localPort.getValue());
     HLowActive = (strncmp(p_hlowactive.getValue(), "T", 1) == 0);
@@ -540,38 +545,70 @@ void setup() {
     ALowActive = (strncmp(p_alowactive.getValue(), "T", 1) == 0);
 
     WriteSettings();
+  }
 
+  if (!HotSpot) {
+    WiFi.setOutputPower(20.5);
+    WiFi.mode(WIFI_STA); // Force to station mode because if device was switched off while in access point mode it will start up next time in access point mode.
     WiFi.setAutoConnect(true);
     WiFi.setAutoReconnect(true);
-
+  } else { 
+    WiFi.setAutoConnect(false);
+    WiFi.setAutoReconnect(false);
+    WiFi.mode(WIFI_AP); // Force to acess point mode.
+    WiFi.softAP(ssid, password);
+    IPAddress myIP = WiFi.softAPIP();
   }
    
   digitalWrite(PIN_LED, HIGH); // Turn led off as we are not in configuration mode.
-  
-  unsigned long startedAt = millis();
-  Serial.print("After waiting ");
-  int connRes = WiFi.waitForConnectResult();
-  float waited = (millis()- startedAt);
-  Serial.print(waited/1000);
-  Serial.print(" secs in setup() connection result is ");
-  Serial.println(connRes);
-  if (WiFi.status()!=WL_CONNECTED){
-    Serial.println("failed to connect, finishing setup anyway");
-  } else{
+
+  if (!HotSpot) {
+    unsigned long startedAt = millis();
+    Serial.print("After waiting ");
+    int connRes = WiFi.waitForConnectResult();
+    float waited = (millis()- startedAt);  
+    Serial.print(waited/1000);
+    Serial.print(" secs in setup() connection result is ");
+    Serial.println(connRes);
+    if (WiFi.status()!=WL_CONNECTED){
+      Serial.println("failed to connect, finishing setup anyway");
+    } else{
+      Serial.print("local ip: ");
+      Serial.println(WiFi.localIP());
+      Udp.begin(localPort);
+      Serial.print("UDP-IN port: ");
+      Serial.println(localPort);
+      UDPip=WiFi.localIP();
+      display.clear();
+      display.setFont(ArialMT_Plain_16);
+      display.setColor(WHITE);
+      display.drawString(0, 0, "IP-Adresse:");
+      display.drawHorizontalLine(0, 28, 128);
+      str=String(UDPip[0])+"."+String(UDPip[1])+"."+String(UDPip[2])+"."+String(UDPip[3]);
+      display.drawString(0, 40, str); 
+      display.display();
+      UDPip[3]=255;
+      Serial.print("UDP-OUT port: ");
+      Serial.println(answerPort); 
+      delay(8000);  
+      server.on("/", Hauptseite);
+      server.begin();                          // HTTP-Server starten
+    }
+  } else {
     Serial.print("local ip: ");
-    Serial.println(WiFi.localIP());
+    Serial.println(myIP);
     Udp.begin(localPort);
     Serial.print("UDP-IN port: ");
     Serial.println(localPort);
-    UDPip=WiFi.localIP();
     display.clear();
     display.setFont(ArialMT_Plain_16);
     display.setColor(WHITE);
-    display.drawString(0, 0, "IP-Adresse:");
+    display.drawString(0, 0, "IP-Adresse:    AP");
     display.drawHorizontalLine(0, 28, 128);
-    str=String(UDPip[0])+"."+String(UDPip[1])+"."+String(UDPip[2])+"."+String(UDPip[3]);
+    str=String(myIP[0])+"."+String(myIP[1])+"."+String(myIP[2])+"."+String(myIP[3]);
     display.drawString(0, 40, str); 
     display.display();
+    UDPip = myIP;
     UDPip[3]=255;
     Serial.print("UDP-OUT port: ");
     Serial.println(answerPort); 
@@ -589,7 +626,7 @@ void loop() {
 
   server.handleClient(); // auf HTTP-Anfragen warten
  
-  if (WiFi.status()!=WL_CONNECTED){
+  if ((WiFi.status()!=WL_CONNECTED) and (!HotSpot)) {
     WiFi.reconnect();
     Serial.println("lost connection");
     delay(5000);
